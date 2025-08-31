@@ -259,6 +259,10 @@ class BusDigital : public Bus {
     static std::vector<LEDType> getLEDTypes();
 
   private:
+    // Temporal dithering state: 8-bit accumulators per channel per LED
+    // Channels are ordered as R,G,B,(W) and optionally (WW,CW) if present.
+    uint8_t *_ditherAcc = nullptr;
+    uint8_t  _ditherChans = 0; // number of channels tracked per LED
     uint8_t  _skip;
     uint8_t  _colorOrder;
     uint8_t  _pins[2];

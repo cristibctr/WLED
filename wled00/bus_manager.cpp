@@ -169,6 +169,18 @@ BusDigital::BusDigital(const BusConfig &bc, uint8_t nr)
   if (_valid) for (unsigned i = 0; i < _skip; i++) {
     PolyBus::setPixelColor(_busPtr, _iType, i, 0, COL_ORDER_GRB); // set sacrificial pixels to black (CO does not matter here)
   }
+  // allocate temporal dithering accumulators (per LED, per used channel)
+  if (_valid) {
+    unsigned chans = 0;
+    if (_hasRgb)   chans += 3;
+    if (_hasWhite) chans += 1;
+    if (_hasCCT)   chans += 2; // track WW & CW if present
+    _ditherChans = (uint8_t)chans;
+    if (_ditherChans > 0 && _len > 0) {
+      size_t bytes = (size_t)_len * (size_t)_ditherChans;
+      _ditherAcc = (uint8_t*)d_calloc(bytes, 1);
+    }
+  }
   DEBUGBUS_PRINTF_P(PSTR("Bus: %successfully inited #%u (len:%u, type:%u (RGB:%d, W:%d, CCT:%d), pins:%u,%u [itype:%u] mA=%d/%d)\n"),
     _valid?"S":"Uns",
     (int)nr,
@@ -232,8 +244,45 @@ void BusDigital::applyBriLimit(uint8_t newBri) {
     for (unsigned i = 0; i < hwLen; i++) {
       uint8_t co = _colorOrderMap.getPixelColorOrder(i+_start, _colorOrder); // need to revert color order for correct color scaling and CCT calc in case white is swapped
       uint32_t c = PolyBus::getPixelColor(_busPtr, _iType, i, co);
-      c = color_fade(c, newBri, true); // apply additional dimming  note: using inline version is a bit faster but overhead of getPixelColor() dominates the speed impact by far
-      if (hasCCT()) Bus::calculateCCT(c, cctWW, cctCW);
+
+      if (_ditherAcc && _ditherChans) {
+        // Dither the extra ABL dimming using the same 8.8 scheme
+        uint8_t r0 = R(c), g0 = G(c), b0 = B(c), w0 = W(c);
+        uint16_t bri = (uint16_t)newBri + 1;
+        // Use logical LED index for accumulator best-effort: i maps 1:1 for standard buses
+        unsigned accPix = i;
+        auto ditherOne = [&](uint8_t src, unsigned chanOff) -> uint8_t {
+          uint16_t v16 = (uint16_t)src * bri;
+          uint8_t base8 = v16 >> 8;
+          uint8_t frac  = v16 & 0xFF;
+          size_t idx = (size_t)accPix * _ditherChans + chanOff;
+          uint16_t acc = (uint16_t)_ditherAcc[idx] + frac;
+          uint8_t bump = acc >> 8;
+          _ditherAcc[idx] = (uint8_t)(acc & 0xFF);
+          uint16_t out = (uint16_t)base8 + bump;
+          return (out > 255) ? 255 : (uint8_t)out;
+        };
+        unsigned off = 0;
+        uint8_t r = 0, g = 0, b = 0, w = 0;
+        if (_hasRgb) { r = ditherOne(r0, off++); g = ditherOne(g0, off++); b = ditherOne(b0, off++); }
+        if (_hasWhite) { w = ditherOne(w0, off++); }
+        uint32_t cd = RGBW32(r,g,b,w);
+        if (hasCCT()) {
+          Bus::calculateCCT(cd, cctWW, cctCW);
+          // Dither WW/CW with remaining channel indices if present
+          unsigned baseOff = (_hasRgb ? 3u : 0u) + (_hasWhite ? 1u : 0u);
+          if (baseOff + 1 < (unsigned)_ditherChans) {
+            cctWW = ditherOne(cctWW, baseOff + 0);
+            cctCW = ditherOne(cctCW, baseOff + 1);
+          }
+        }
+        c = (_type == TYPE_WS2812_WWA) ? RGBW32(cctWW, cctCW, 0, w) : cd;
+      } else {
+        // Fallback: standard video scaling
+        c = color_fade(c, newBri, true);
+        if (hasCCT()) Bus::calculateCCT(c, cctWW, cctCW);
+      }
+
       PolyBus::setPixelColor(_busPtr, _iType, i, c, co, (cctCW<<8) | cctWW); // repaint all pixels with new brightness
     }
   }
@@ -264,15 +313,43 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
   if (!_valid) return;
   if (hasWhite()) c = autoWhiteCalc(c);
   if (Bus::_cct >= 1900) c = colorBalanceFromKelvin(Bus::_cct, c); //color correction from CCT
-  c = color_fade(c, _bri, true); // apply brightness
+  // Temporal dithering on final 8-bit channels using 8.8 fixed-point brightness.
+  // If no accumulator available, fall back to existing video scaling.
+  if (_ditherAcc && _ditherChans) {
+    unsigned accPix = pix;
+    if (_reversed) accPix = _len - accPix - 1;
+    uint8_t r0 = R(c), g0 = G(c), b0 = B(c), w0 = W(c);
+    uint16_t bri = (uint16_t)_bri + 1;
+    auto ditherOne = [&](uint8_t src, unsigned chanOff) -> uint8_t {
+      uint16_t v16 = (uint16_t)src * bri;
+      uint8_t base8 = v16 >> 8;
+      uint8_t frac  = v16 & 0xFF;
+      size_t idx = (size_t)accPix * _ditherChans + chanOff;
+      uint16_t acc = (uint16_t)_ditherAcc[idx] + frac;
+      uint8_t bump = acc >> 8;
+      _ditherAcc[idx] = (uint8_t)(acc & 0xFF);
+      uint16_t out = (uint16_t)base8 + bump;
+      return (out > 255) ? 255 : (uint8_t)out;
+    };
+    unsigned off = 0;
+    uint8_t rr = 0, gg = 0, bb = 0, ww = 0;
+    if (_hasRgb) { rr = ditherOne(r0, off++); gg = ditherOne(g0, off++); bb = ditherOne(b0, off++); }
+    if (_hasWhite) { ww = ditherOne(w0, off++); }
 
-  if (BusManager::_useABL) {
-    // if using ABL, sum all color channels to estimate current and limit brightness in show()
-    uint8_t r = R(c), g = G(c), b = B(c);
-    if (_milliAmpsPerLed < 255) { // normal ABL
-      _colorSum += r + g + b + W(c);
-    } else { // wacky WS2815 power model, ignore white channel, use max of RGB (issue #549)
-      _colorSum += ((r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b));
+    // compose dithered RGBW; CCT splitting is applied afterwards below
+    c = RGBW32(rr, gg, bb, ww);
+
+    if (BusManager::_useABL) {
+      uint8_t r = R(c), g = G(c), b = B(c);
+      if (_milliAmpsPerLed < 255) _colorSum += r + g + b + W(c);
+      else                        _colorSum += ((r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b));
+    }
+  } else {
+    c = color_fade(c, _bri, true); // apply brightness
+    if (BusManager::_useABL) {
+      uint8_t r = R(c), g = G(c), b = B(c);
+      if (_milliAmpsPerLed < 255) _colorSum += r + g + b + W(c);
+      else                        _colorSum += ((r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b));
     }
   }
 
@@ -293,6 +370,29 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
   if (hasCCT()) {
     uint8_t cctWW = 0, cctCW = 0;
     Bus::calculateCCT(c, cctWW, cctCW);
+    // Optionally dither WW/CW as separate channels using same accumulator
+    if (_ditherAcc && _ditherChans) {
+      unsigned accPix = pix;
+      if (_reversed) accPix = _len - accPix - 1;
+      // Determine base channel offset: RGB(3) + W(1 if present)
+      unsigned baseOff = (_hasRgb ? 3u : 0u) + (_hasWhite ? 1u : 0u);
+      uint16_t bri = (uint16_t)_bri + 1;
+      auto ditherAt = [&](uint8_t src, unsigned chanOff) -> uint8_t {
+        uint16_t v16 = (uint16_t)src * bri;
+        uint8_t base8 = v16 >> 8;
+        uint8_t frac  = v16 & 0xFF;
+        size_t idx = (size_t)accPix * _ditherChans + chanOff;
+        uint16_t acc = (uint16_t)_ditherAcc[idx] + frac;
+        uint8_t bump = acc >> 8;
+        _ditherAcc[idx] = (uint8_t)(acc & 0xFF);
+        uint16_t out = (uint16_t)base8 + bump;
+        return (out > 255) ? 255 : (uint8_t)out;
+      };
+      if (baseOff + 1 < (unsigned)_ditherChans) {
+        cctWW = ditherAt(cctWW, baseOff + 0);
+        cctCW = ditherAt(cctCW, baseOff + 1);
+      }
+    }
     wwcw = (cctCW<<8) | cctWW;
     if (_type == TYPE_WS2812_WWA) c = RGBW32(cctWW, cctCW, 0, W(c));
   }
@@ -372,6 +472,7 @@ void BusDigital::begin() {
 
 void BusDigital::cleanup() {
   DEBUGBUS_PRINTLN(F("Digital Cleanup."));
+  if (_ditherAcc) { d_free(_ditherAcc); _ditherAcc = nullptr; _ditherChans = 0; }
   PolyBus::cleanup(_busPtr, _iType);
   _iType = I_NONE;
   _valid = false;
