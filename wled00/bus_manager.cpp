@@ -169,17 +169,19 @@ BusDigital::BusDigital(const BusConfig &bc, uint8_t nr)
   if (_valid) for (unsigned i = 0; i < _skip; i++) {
     PolyBus::setPixelColor(_busPtr, _iType, i, 0, COL_ORDER_GRB); // set sacrificial pixels to black (CO does not matter here)
   }
-  // allocate temporal dithering accumulators (per LED, per used channel)
+  // allocate temporal dithering accumulators (per LED) and residuals (per LED x channel)
   if (_valid) {
     unsigned chans = 0;
     if (_hasRgb)   chans += 3;
     if (_hasWhite) chans += 1;
     if (_hasCCT)   chans += 2; // track WW & CW if present
     _ditherChans = (uint8_t)chans;
-    if (_ditherChans > 0 && _len > 0) {
-      size_t bytes = (size_t)_len * (size_t)_ditherChans;
-      _ditherAcc = (uint8_t*)d_calloc(bytes, 1);
+    if (_len > 0) {
+      _ditherAcc = (uint8_t*)d_calloc((size_t)_len, 1);
+      if (_ditherChans > 0) _ditherRes = (uint8_t*)d_calloc((size_t)_len * (size_t)_ditherChans, 1);
     }
+    // Force periodic refresh so temporal dithering runs even on static colors
+    if (_ditherAcc) _needsRefresh = true;
   }
   DEBUGBUS_PRINTF_P(PSTR("Bus: %successfully inited #%u (len:%u, type:%u (RGB:%d, W:%d, CCT:%d), pins:%u,%u [itype:%u] mA=%d/%d)\n"),
     _valid?"S":"Uns",
@@ -245,38 +247,73 @@ void BusDigital::applyBriLimit(uint8_t newBri) {
       uint8_t co = _colorOrderMap.getPixelColorOrder(i+_start, _colorOrder); // need to revert color order for correct color scaling and CCT calc in case white is swapped
       uint32_t c = PolyBus::getPixelColor(_busPtr, _iType, i, co);
 
-      if (_ditherAcc && _ditherChans) {
-        // Dither the extra ABL dimming using the same 8.8 scheme
-        uint8_t r0 = R(c), g0 = G(c), b0 = B(c), w0 = W(c);
-        uint16_t bri = (uint16_t)newBri + 1;
-        // Use logical LED index for accumulator best-effort: i maps 1:1 for standard buses
+      if (_ditherAcc) {
+        // Shared-accumulator dithering for ABL scaling
+        const uint16_t bri = (uint16_t)newBri + 1;
         unsigned accPix = i;
-        auto ditherOne = [&](uint8_t src, unsigned chanOff) -> uint8_t {
-          uint16_t v16 = (uint16_t)src * bri;
-          uint8_t base8 = v16 >> 8;
-          uint8_t frac  = v16 & 0xFF;
-          size_t idx = (size_t)accPix * _ditherChans + chanOff;
-          uint16_t acc = (uint16_t)_ditherAcc[idx] + frac;
-          uint8_t bump = acc >> 8;
-          _ditherAcc[idx] = (uint8_t)(acc & 0xFF);
-          uint16_t out = (uint16_t)base8 + bump;
-          return (out > 255) ? 255 : (uint8_t)out;
-        };
-        unsigned off = 0;
-        uint8_t r = 0, g = 0, b = 0, w = 0;
-        if (_hasRgb) { r = ditherOne(r0, off++); g = ditherOne(g0, off++); b = ditherOne(b0, off++); }
-        if (_hasWhite) { w = ditherOne(w0, off++); }
-        uint32_t cd = RGBW32(r,g,b,w);
+        if (_reversed) accPix = _len - accPix - 1;
+
+        uint8_t r0 = R(c), g0 = G(c), b0 = B(c), w0 = W(c);
+        uint8_t cctWW0 = 0, cctCW0 = 0;
+        bool useWWCWInRGB = false;
         if (hasCCT()) {
-          Bus::calculateCCT(cd, cctWW, cctCW);
-          // Dither WW/CW with remaining channel indices if present
-          unsigned baseOff = (_hasRgb ? 3u : 0u) + (_hasWhite ? 1u : 0u);
-          if (baseOff + 1 < (unsigned)_ditherChans) {
-            cctWW = ditherOne(cctWW, baseOff + 0);
-            cctCW = ditherOne(cctCW, baseOff + 1);
+          // Use current color for CCT split
+          Bus::calculateCCT(c, cctWW0, cctCW0);
+          useWWCWInRGB = (_type == TYPE_WS2812_WWA);
+        }
+
+        uint8_t src[6]; uint8_t base8[6]; uint8_t frac[6]; uint8_t cnt = 0;
+        if (hasCCT() && useWWCWInRGB) {
+          src[cnt++] = cctWW0; src[cnt++] = cctCW0; if (_hasWhite) src[cnt++] = w0;
+        } else {
+          if (_hasRgb) { src[cnt++] = r0; src[cnt++] = g0; src[cnt++] = b0; }
+          if (_hasWhite) src[cnt++] = w0;
+          if (hasCCT()) { src[cnt++] = cctWW0; src[cnt++] = cctCW0; }
+        }
+
+        if (cnt) {
+          uint16_t sumFrac = 0;
+          for (uint8_t k = 0; k < cnt; k++) {
+            uint16_t v16 = (uint16_t)src[k] * bri;
+            base8[k] = (uint8_t)(v16 >> 8);
+            frac[k]  = (uint8_t)(v16 & 0xFF);
+            sumFrac += frac[k];
+          }
+          uint16_t gacc = (uint16_t)_ditherAcc[accPix] + sumFrac;
+          uint8_t extra = (uint8_t)(gacc >> 8);
+          _ditherAcc[accPix] = (uint8_t)(gacc & 0xFF);
+          if (_ditherRes && _ditherChans >= cnt) {
+            uint16_t res[6]; size_t resBase = (size_t)accPix * (size_t)_ditherChans;
+            for (uint8_t k = 0; k < cnt; k++) res[k] = (uint16_t)_ditherRes[resBase + k] + frac[k];
+            for (uint8_t e = 0; e < extra; e++) {
+              uint8_t best = 0; for (uint8_t i2 = 1; i2 < cnt; i2++) if (res[i2] > res[best]) best = i2;
+              if (base8[best] < 255) base8[best]++;
+              if (res[best] >= 256) res[best] -= 256; else res[best] = 0;
+            }
+            for (uint8_t k = 0; k < cnt; k++) _ditherRes[resBase + k] = (uint8_t)(res[k] & 0xFF);
+          } else if (extra) {
+            uint8_t idx[6]; for (uint8_t k = 0; k < cnt; k++) idx[k] = k;
+            for (uint8_t a = 0; a < cnt - 1; a++) {
+              uint8_t best = a;
+              for (uint8_t b = a + 1; b < cnt; b++) if (frac[idx[b]] > frac[idx[best]]) best = b;
+              if (best != a) { uint8_t t = idx[a]; idx[a] = idx[best]; idx[best] = t; }
+            }
+            for (uint8_t e = 0; e < extra; e++) { uint8_t k = idx[e % cnt]; if (base8[k] < 255) base8[k]++; }
+          }
+        
+          if (hasCCT() && useWWCWInRGB) {
+            uint8_t ww = base8[0]; uint8_t cw = base8[1]; uint8_t w = (_hasWhite && cnt >= 3) ? base8[2] : 0;
+            c = RGBW32(ww, cw, 0, w);
+            cctWW = ww; cctCW = cw;
+          } else {
+            uint8_t off = 0; uint8_t rr=0, gg=0, bb=0, ww=0; uint8_t wwCh=0, cwCh=0;
+            if (_hasRgb) { rr = base8[off++]; gg = base8[off++]; bb = base8[off++]; }
+            if (_hasWhite) { ww = base8[off++]; }
+            if (hasCCT()) { wwCh = base8[off++]; cwCh = base8[off++]; }
+            c = RGBW32(rr, gg, bb, ww);
+            if (hasCCT()) { cctWW = wwCh; cctCW = cwCh; }
           }
         }
-        c = (_type == TYPE_WS2812_WWA) ? RGBW32(cctWW, cctCW, 0, w) : cd;
       } else {
         // Fallback: standard video scaling
         c = color_fade(c, newBri, true);
@@ -313,31 +350,95 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
   if (!_valid) return;
   if (hasWhite()) c = autoWhiteCalc(c);
   if (Bus::_cct >= 1900) c = colorBalanceFromKelvin(Bus::_cct, c); //color correction from CCT
-  // Temporal dithering on final 8-bit channels using 8.8 fixed-point brightness.
+  // Temporal dithering (shared accumulator per LED) using 8.8 fixed-point brightness.
   // If no accumulator available, fall back to existing video scaling.
-  if (_ditherAcc && _ditherChans) {
+  uint16_t out_wwcw = 0; // carries WW/CW for CCT types when dithering applied
+  if (_ditherAcc) {
     unsigned accPix = pix;
     if (_reversed) accPix = _len - accPix - 1;
-    uint8_t r0 = R(c), g0 = G(c), b0 = B(c), w0 = W(c);
-    uint16_t bri = (uint16_t)_bri + 1;
-    auto ditherOne = [&](uint8_t src, unsigned chanOff) -> uint8_t {
-      uint16_t v16 = (uint16_t)src * bri;
-      uint8_t base8 = v16 >> 8;
-      uint8_t frac  = v16 & 0xFF;
-      size_t idx = (size_t)accPix * _ditherChans + chanOff;
-      uint16_t acc = (uint16_t)_ditherAcc[idx] + frac;
-      uint8_t bump = acc >> 8;
-      _ditherAcc[idx] = (uint8_t)(acc & 0xFF);
-      uint16_t out = (uint16_t)base8 + bump;
-      return (out > 255) ? 255 : (uint8_t)out;
-    };
-    unsigned off = 0;
-    uint8_t rr = 0, gg = 0, bb = 0, ww = 0;
-    if (_hasRgb) { rr = ditherOne(r0, off++); gg = ditherOne(g0, off++); bb = ditherOne(b0, off++); }
-    if (_hasWhite) { ww = ditherOne(w0, off++); }
+    const uint16_t bri = (uint16_t)_bri + 1;
 
-    // compose dithered RGBW; CCT splitting is applied afterwards below
-    c = RGBW32(rr, gg, bb, ww);
+    // Build list of active output channels for this LED (pre-brightness values)
+    uint8_t r0 = R(c), g0 = G(c), b0 = B(c), w0 = W(c);
+    uint8_t cctWW0 = 0, cctCW0 = 0;
+    bool useWWCWInRGB = false;
+    if (hasCCT()) {
+      Bus::calculateCCT(c, cctWW0, cctCW0);
+      useWWCWInRGB = (_type == TYPE_WS2812_WWA);
+    }
+
+    // Up to 5 channels (R,G,B,W,WW,CW) but WW/CW may replace RGB for WWA
+    uint8_t src[6];   // src channel values (pre-brightness)
+    uint8_t base[6];  // base after brightness scaling
+    uint8_t frac[6];  // fractional parts after brightness scaling
+    uint8_t count = 0;
+
+    if (hasCCT() && useWWCWInRGB) {
+      // WWA mapping: use WW, CW (mapped later to RGB), plus W if present
+      src[count++] = cctWW0;
+      src[count++] = cctCW0;
+      if (_hasWhite) src[count++] = w0;
+    } else {
+      if (_hasRgb) { src[count++] = r0; src[count++] = g0; src[count++] = b0; }
+      if (_hasWhite) src[count++] = w0;
+      if (hasCCT()) { src[count++] = cctWW0; src[count++] = cctCW0; }
+    }
+
+    if (count == 0) goto POST_DITHER;
+
+    // 8.8 scaling, collect base and frac
+    uint16_t sumFrac = 0;
+    for (uint8_t i = 0; i < count; i++) {
+      uint16_t v16 = (uint16_t)src[i] * bri;
+      base[i] = (uint8_t)(v16 >> 8);
+      frac[i] = (uint8_t)(v16 & 0xFF);
+      sumFrac += frac[i];
+    }
+    // Determine total extras using shared per-LED accumulator
+    uint16_t gacc = (uint16_t)_ditherAcc[accPix] + sumFrac;
+    uint8_t extra = (uint8_t)(gacc >> 8);
+    _ditherAcc[accPix] = (uint8_t)(gacc & 0xFF);
+    // Update per-channel residuals and distribute extras fairly
+    if (_ditherRes && _ditherChans >= count) {
+      uint16_t res[6];
+      size_t resBase = (size_t)accPix * (size_t)_ditherChans;
+      for (uint8_t i = 0; i < count; i++) res[i] = (uint16_t)_ditherRes[resBase + i] + frac[i];
+      for (uint8_t e = 0; e < extra; e++) {
+        uint8_t best = 0;
+        for (uint8_t i = 1; i < count; i++) if (res[i] > res[best]) best = i;
+        if (base[best] < 255) base[best]++;
+        if (res[best] >= 256) res[best] -= 256; else res[best] = 0;
+      }
+      for (uint8_t i = 0; i < count; i++) _ditherRes[resBase + i] = (uint8_t)(res[i] & 0xFF);
+    } else if (extra) {
+      // Fallback: distribute by current frame fractional ranking
+      uint8_t idx[6]; for (uint8_t i = 0; i < count; i++) idx[i] = i;
+      for (uint8_t i = 0; i < count - 1; i++) {
+        uint8_t best = i; for (uint8_t j = i + 1; j < count; j++) if (frac[idx[j]] > frac[idx[best]]) best = j;
+        if (best != i) { uint8_t t = idx[i]; idx[i] = idx[best]; idx[best] = t; }
+      }
+      for (uint8_t e = 0; e < extra; e++) { uint8_t k = idx[e % count]; if (base[k] < 255) base[k]++; }
+    }
+
+    // Write back dithered values to c / wwcw according to bus type
+    // compute dithered outputs and record WW/CW if applicable
+    if (hasCCT() && useWWCWInRGB) {
+      // WWA: base[0]=WW, base[1]=CW, optional base[2]=W
+      uint8_t ww = base[0];
+      uint8_t cw = base[1];
+      uint8_t w  = (_hasWhite && count >= 3) ? base[2] : 0;
+      c = RGBW32(ww, cw, 0, w);
+      out_wwcw = ((uint16_t)cw << 8) | ww;
+    } else {
+      uint8_t off = 0;
+      uint8_t rr=0, gg=0, bb=0, ww=0, wwCh=0, cwCh=0;
+      if (_hasRgb) { rr = base[off++]; gg = base[off++]; bb = base[off++]; }
+      if (_hasWhite) { ww = base[off++]; }
+      if (hasCCT()) { wwCh = base[off++]; cwCh = base[off++]; }
+      c = RGBW32(rr, gg, bb, ww);
+      // set CCT later via wwcw below
+      if (hasCCT()) out_wwcw = ((uint16_t)cwCh << 8) | wwCh;
+    }
 
     if (BusManager::_useABL) {
       uint8_t r = R(c), g = G(c), b = B(c);
@@ -353,6 +454,7 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     }
   }
 
+POST_DITHER:
   if (_reversed) pix = _len - pix -1;
   pix += _skip;
   const uint8_t co = _colorOrderMap.getPixelColorOrder(pix+_start, _colorOrder);
@@ -367,32 +469,12 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     }
   }
   uint16_t wwcw = 0;
-  if (hasCCT()) {
+  if (_ditherAcc) {
+    // Use the precomputed CCT values when dithering was applied
+    wwcw = out_wwcw; // may be 0 if no CCT
+  } else if (hasCCT()) {
     uint8_t cctWW = 0, cctCW = 0;
     Bus::calculateCCT(c, cctWW, cctCW);
-    // Optionally dither WW/CW as separate channels using same accumulator
-    if (_ditherAcc && _ditherChans) {
-      unsigned accPix = pix;
-      if (_reversed) accPix = _len - accPix - 1;
-      // Determine base channel offset: RGB(3) + W(1 if present)
-      unsigned baseOff = (_hasRgb ? 3u : 0u) + (_hasWhite ? 1u : 0u);
-      uint16_t bri = (uint16_t)_bri + 1;
-      auto ditherAt = [&](uint8_t src, unsigned chanOff) -> uint8_t {
-        uint16_t v16 = (uint16_t)src * bri;
-        uint8_t base8 = v16 >> 8;
-        uint8_t frac  = v16 & 0xFF;
-        size_t idx = (size_t)accPix * _ditherChans + chanOff;
-        uint16_t acc = (uint16_t)_ditherAcc[idx] + frac;
-        uint8_t bump = acc >> 8;
-        _ditherAcc[idx] = (uint8_t)(acc & 0xFF);
-        uint16_t out = (uint16_t)base8 + bump;
-        return (out > 255) ? 255 : (uint8_t)out;
-      };
-      if (baseOff + 1 < (unsigned)_ditherChans) {
-        cctWW = ditherAt(cctWW, baseOff + 0);
-        cctCW = ditherAt(cctCW, baseOff + 1);
-      }
-    }
     wwcw = (cctCW<<8) | cctWW;
     if (_type == TYPE_WS2812_WWA) c = RGBW32(cctWW, cctCW, 0, W(c));
   }
@@ -472,7 +554,9 @@ void BusDigital::begin() {
 
 void BusDigital::cleanup() {
   DEBUGBUS_PRINTLN(F("Digital Cleanup."));
-  if (_ditherAcc) { d_free(_ditherAcc); _ditherAcc = nullptr; _ditherChans = 0; }
+  if (_ditherAcc) { d_free(_ditherAcc); _ditherAcc = nullptr; }
+  if (_ditherRes) { d_free(_ditherRes); _ditherRes = nullptr; }
+  _ditherChans = 0;
   PolyBus::cleanup(_busPtr, _iType);
   _iType = I_NONE;
   _valid = false;

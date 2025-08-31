@@ -1240,7 +1240,8 @@ void WS2812FX::service() {
     if (!seg.isActive()) continue;
 
     // last condition ensures all solid segments are updated at the same time
-    if (nowUp > seg.next_time || _triggered || (doShow && seg.mode == FX_MODE_STATIC))
+    // also force updates for static segments when periodic refresh is required (e.g., dithering)
+    if (nowUp > seg.next_time || _triggered || ((doShow || _isOffRefreshRequired) && seg.mode == FX_MODE_STATIC))
     {
       doShow = true;
       unsigned frameDelay = FRAMETIME;

@@ -259,10 +259,12 @@ class BusDigital : public Bus {
     static std::vector<LEDType> getLEDTypes();
 
   private:
-    // Temporal dithering state: 8-bit accumulators per channel per LED
-    // Channels are ordered as R,G,B,(W) and optionally (WW,CW) if present.
+    // Temporal dithering state: 1 accumulator byte per LED (shared across channels)
+    // Accumulates the sum of fractional parts for all active output channels.
     uint8_t *_ditherAcc = nullptr;
-    uint8_t  _ditherChans = 0; // number of channels tracked per LED
+    // Persistent per-channel residuals (fractional error) for fair distribution
+    uint8_t *_ditherRes = nullptr;
+    uint8_t  _ditherChans = 0; // number of active channels (for info only)
     uint8_t  _skip;
     uint8_t  _colorOrder;
     uint8_t  _pins[2];
